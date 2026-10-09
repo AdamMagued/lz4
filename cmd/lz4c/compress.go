@@ -17,6 +17,16 @@ import (
 	"github.com/pierrec/lz4/v4"
 )
 
+type writer interface {
+	io.WriteCloser
+	Apply(options ...lz4.Option) error
+	Reset(io.Writer)
+}
+
+var newWriter = func(w io.Writer) writer {
+	return lz4.NewWriter(w)
+}
+
 // Compress compresses a set of files or from stdin to stdout.
 func Compress(fs *flag.FlagSet) cmdflag.Handler {
 	var blockMaxSize string
@@ -62,7 +72,7 @@ func Compress(fs *flag.FlagSet) cmdflag.Handler {
 			return 0, err
 		}
 
-		zw := lz4.NewWriter(nil)
+		zw := newWriter(nil)
 		options := []lz4.Option{
 			lz4.BlockChecksumOption(blockChecksum),
 			lz4.BlockSizeOption(lz4.BlockSize(sz)),
