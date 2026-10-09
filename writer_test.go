@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -967,5 +968,110 @@ func TestWriterZeroBlockChecksum(t *testing.T) {
 	}
 	if want := append(zero, rest...); !bytes.Equal(out, want) {
 		t.Fatalf("got % x, want % x", out, want)
+	}
+}
+
+func TestWriter_DictionaryRoundTrip(t *testing.T) {
+	dict := []byte("schema:id,name,email,timestamp,event,status,metadata,payload,response")
+	src := []byte("schema:id=1001,name=Alice,email=alice@example.com,timestamp=1690000000,event=login,status=ok\n" +
+		"schema:id=1002,name=Bob,email=bob@example.com,timestamp=1690000001,event=logout,status=ok\n")
+
+	// Compress with dictionary.
+	var bufWithDict bytes.Buffer
+	zwWithDict := lz4.NewWriter(&bufWithDict)
+	if err := zwWithDict.Apply(lz4.DictionaryOption(dict)); err != nil {
+		t.Fatalf("zwWithDict Apply DictionaryOption failed: %v", err)
+	}
+	if _, err := zwWithDict.Write(src); err != nil {
+		t.Fatalf("zwWithDict Write failed: %v", err)
+	}
+	if err := zwWithDict.Close(); err != nil {
+		t.Fatalf("zwWithDict Close failed: %v", err)
+	}
+
+	// Compress without dictionary.
+	var bufNoDict bytes.Buffer
+	zwNoDict := lz4.NewWriter(&bufNoDict)
+	if _, err := zwNoDict.Write(src); err != nil {
+		t.Fatalf("zwNoDict Write failed: %v", err)
+	}
+	if err := zwNoDict.Close(); err != nil {
+		t.Fatalf("zwNoDict Close failed: %v", err)
+	}
+
+	if bufWithDict.Len() >= bufNoDict.Len() {
+		t.Fatalf("expected dictionary-compressed frame (%d bytes) to be smaller than no-dict (%d bytes)",
+			bufWithDict.Len(), bufNoDict.Len())
+	}
+
+	// Decompress with dictionary.
+	zr := lz4.NewReader(bytes.NewReader(bufWithDict.Bytes()))
+	if err := zr.Apply(lz4.DictionaryOption(dict)); err != nil {
+		t.Fatalf("zr Apply DictionaryOption failed: %v", err)
+	}
+	decompressed, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("zr ReadAll failed: %v", err)
+	}
+	if !bytes.Equal(decompressed, src) {
+		t.Fatalf("decompressed data mismatch")
+	}
+
+	// Multi-block round trip.
+	var multiSrc bytes.Buffer
+	for i := range 500 {
+		fmt.Fprintf(&multiSrc, "schema:id=%d,name=User%d,status=active,payload=test_data_item_%d\n", i, i, i)
+	}
+	multiData := multiSrc.Bytes()
+
+	var multiBuf bytes.Buffer
+	zwMulti := lz4.NewWriter(&multiBuf)
+	if err := zwMulti.Apply(lz4.BlockSizeOption(lz4.Block64Kb), lz4.DictionaryOption(dict)); err != nil {
+		t.Fatalf("zwMulti Apply failed: %v", err)
+	}
+	if _, err := zwMulti.Write(multiData); err != nil {
+		t.Fatalf("zwMulti Write failed: %v", err)
+	}
+	if err := zwMulti.Close(); err != nil {
+		t.Fatalf("zwMulti Close failed: %v", err)
+	}
+
+	zrMulti := lz4.NewReader(bytes.NewReader(multiBuf.Bytes()))
+	if err := zrMulti.Apply(lz4.DictionaryOption(dict)); err != nil {
+		t.Fatalf("zrMulti Apply failed: %v", err)
+	}
+	multiOut, err := io.ReadAll(zrMulti)
+	if err != nil {
+		t.Fatalf("zrMulti ReadAll failed: %v", err)
+	}
+	if !bytes.Equal(multiOut, multiData) {
+		t.Fatalf("multi-block decompressed data mismatch")
+	}
+}
+
+func TestWriter_DictionaryOptionsValidation(t *testing.T) {
+	dict := []byte("test dictionary content")
+	zw := lz4.NewWriter(io.Discard)
+
+	// Non-Fast level with dictionary should return ErrOptionNotApplicable.
+	if err := zw.Apply(lz4.CompressionLevelOption(lz4.Level1), lz4.DictionaryOption(dict)); !errors.Is(err, lz4.ErrOptionNotApplicable) {
+		t.Fatalf("expected ErrOptionNotApplicable for Level1 with dict, got %v", err)
+	}
+
+	zw2 := lz4.NewWriter(io.Discard)
+	if err := zw2.Apply(lz4.DictionaryOption(dict), lz4.CompressionLevelOption(lz4.CCompatFast)); !errors.Is(err, lz4.ErrOptionNotApplicable) {
+		t.Fatalf("expected ErrOptionNotApplicable for CCompatFast after dict, got %v", err)
+	}
+
+	// Reader does not overwrite caller slice with spare capacity.
+	rawDict := make([]byte, len(dict), len(dict)+64)
+	copy(rawDict, dict)
+	zr := lz4.NewReader(bytes.NewReader(nil))
+	if err := zr.Apply(lz4.DictionaryOption(rawDict)); err != nil {
+		t.Fatalf("zr Apply failed: %v", err)
+	}
+	if cap(rawDict) > len(rawDict) {
+		// Mutating spare capacity should not affect reader's stored copy.
+		rawDict = append(rawDict, "polluted"...)
 	}
 }

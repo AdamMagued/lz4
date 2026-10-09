@@ -26,6 +26,7 @@ type CompressingReader struct {
 	in      []byte
 	out     ovWriter
 	handler func(int)
+	dict    []byte
 }
 
 // NewCompressingReader creates a reader which reads compressed data from
@@ -119,8 +120,8 @@ func (zrd *CompressingReader) Read(p []byte) (n int, err error) {
 		rCount, err = io.ReadFull(zrd.src, zrd.in)
 		switch err {
 		case nil:
-			err = block.Compress(
-				zrd.frame, zrd.in[:rCount], zrd.level,
+			err = block.CompressWithDict(
+				zrd.frame, zrd.in[:rCount], zrd.level, zrd.dict,
 			).Write(zrd.frame, &zrd.out)
 			zrd.handler(len(block.Data))
 			if err != nil {
@@ -135,8 +136,8 @@ func (zrd *CompressingReader) Read(p []byte) (n int, err error) {
 			}
 		case io.EOF, io.ErrUnexpectedEOF: // read may be partial
 			if rCount > 0 {
-				err = block.Compress(
-					zrd.frame, zrd.in[:rCount], zrd.level,
+				err = block.CompressWithDict(
+					zrd.frame, zrd.in[:rCount], zrd.level, zrd.dict,
 				).Write(zrd.frame, &zrd.out)
 				zrd.handler(len(block.Data))
 				if err != nil {

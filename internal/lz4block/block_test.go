@@ -213,3 +213,176 @@ func readGz(fname string) ([]byte, error) {
 	}
 	return io.ReadAll(gzr)
 }
+
+func TestCompressBlockWithDict_Basic(t *testing.T) {
+	dict := []byte("The quick brown fox jumps over the lazy dog. 1234567890abcdefghijklmnopqrstuvwxyz")
+	src := []byte("The quick brown fox jumps over the lazy dog! Pack my box with five dozen liquor jugs.")
+
+	bound := lz4block.CompressBlockBound(len(src))
+	dstWithDict := make([]byte, bound)
+	dstNoDict := make([]byte, bound)
+
+	nWithDict, err := lz4block.CompressBlockWithDict(src, dstWithDict, dict)
+	if err != nil {
+		t.Fatalf("CompressBlockWithDict failed: %v", err)
+	}
+	dstWithDict = dstWithDict[:nWithDict]
+
+	nNoDict, err := lz4block.CompressBlock(src, dstNoDict)
+	if err != nil {
+		t.Fatalf("CompressBlock failed: %v", err)
+	}
+	dstNoDict = dstNoDict[:nNoDict]
+
+	if nWithDict >= nNoDict {
+		t.Fatalf("expected dictionary compression (%d bytes) to be smaller than no-dict (%d bytes)", nWithDict, nNoDict)
+	}
+
+	dec := make([]byte, len(src))
+	dn, err := lz4block.UncompressBlock(dstWithDict, dec, dict)
+	if err != nil {
+		t.Fatalf("UncompressBlock failed: %v", err)
+	}
+	if dn != len(src) {
+		t.Fatalf("expected uncompressed size %d, got %d", len(src), dn)
+	}
+	if !bytes.Equal(dec, src) {
+		t.Fatalf("uncompressed output mismatch")
+	}
+}
+
+func TestCompressBlockWithDict_CrossBoundary(t *testing.T) {
+	dict := []byte("prefix--0123456789ABCDEF")
+	// The pattern "0123456789ABCDEF" is at the end of dict (16 bytes).
+	// In src, we repeat "0123456789ABCDEF" followed by "XYZW", then another repetition.
+	src := append([]byte("0123456789ABCDEFextra_bytes_here"), bytes.Repeat([]byte("0123456789ABCDEF"), 4)...)
+
+	dst := make([]byte, lz4block.CompressBlockBound(len(src)))
+	n, err := lz4block.CompressBlockWithDict(src, dst, dict)
+	if err != nil {
+		t.Fatalf("CompressBlockWithDict failed: %v", err)
+	}
+
+	dec := make([]byte, len(src))
+	dn, err := lz4block.UncompressBlock(dst[:n], dec, dict)
+	if err != nil {
+		t.Fatalf("UncompressBlock failed: %v", err)
+	}
+	if dn != len(src) || !bytes.Equal(dec, src) {
+		t.Fatalf("round-trip mismatch across dictionary boundary")
+	}
+}
+
+func TestCompressBlockWithDict_EdgeCases(t *testing.T) {
+	data := []byte("hello world, this is a test string for dictionary compression edge cases")
+
+	for _, dict := range [][]byte{
+		nil,
+		{},
+		[]byte("a"),
+		[]byte("abc"),
+		bytes.Repeat([]byte("xyz"), 30000), // > 64 KB dict
+	} {
+		dst := make([]byte, lz4block.CompressBlockBound(len(data)))
+		n, err := lz4block.CompressBlockWithDict(data, dst, dict)
+		if err != nil {
+			t.Fatalf("dict len %d: CompressBlockWithDict error: %v", len(dict), err)
+		}
+		dec := make([]byte, len(data))
+		dn, err := lz4block.UncompressBlock(dst[:n], dec, dict)
+		if err != nil {
+			t.Fatalf("dict len %d: UncompressBlock error: %v", len(dict), err)
+		}
+		if dn != len(data) || !bytes.Equal(dec, data) {
+			t.Fatalf("dict len %d: round-trip mismatch", len(dict))
+		}
+	}
+
+	// Empty source.
+	emptyDst := make([]byte, 16)
+	n, err := lz4block.CompressBlockWithDict(nil, emptyDst, []byte("dict"))
+	if err != nil {
+		t.Fatalf("empty src CompressBlockWithDict error: %v", err)
+	}
+	dec := make([]byte, 16)
+	dn, err := lz4block.UncompressBlock(emptyDst[:n], dec, []byte("dict"))
+	if err != nil {
+		t.Fatalf("empty src UncompressBlock error: %v", err)
+	}
+	if dn != 0 {
+		t.Fatalf("expected 0 bytes for empty src, got %d", dn)
+	}
+
+	// Short dst buffer error.
+	shortDst := make([]byte, 2)
+	_, err = lz4block.CompressBlockWithDict(data, shortDst, []byte("dict"))
+	if err != lz4errors.ErrInvalidSourceShortBuffer && err != nil {
+		t.Fatalf("expected ErrInvalidSourceShortBuffer, got %v", err)
+	}
+}
+
+func TestCompressBlockWithDict_LargeData(t *testing.T) {
+	dict := bytes.Repeat([]byte("0123456789abcdef"), 2048) // 32 KB dict
+	var src bytes.Buffer
+	for i := range 1000 {
+		src.WriteString(fmt.Sprintf("block_%d_data_0123456789abcdef_", i))
+	}
+	input := src.Bytes()
+
+	dst := make([]byte, lz4block.CompressBlockBound(len(input)))
+	var c lz4block.Compressor
+	n, err := c.CompressBlockWithDict(input, dst, dict)
+	if err != nil {
+		t.Fatalf("CompressBlockWithDict large data failed: %v", err)
+	}
+
+	dec := make([]byte, len(input))
+	dn, err := lz4block.UncompressBlock(dst[:n], dec, dict)
+	if err != nil {
+		t.Fatalf("UncompressBlock large data failed: %v", err)
+	}
+	if dn != len(input) || !bytes.Equal(dec, input) {
+		t.Fatalf("large data round-trip mismatch")
+	}
+}
+
+func TestCompressBlockWithDict_CompressorReuse(t *testing.T) {
+	var c lz4block.Compressor
+	dict1 := []byte("first dictionary content with common prefixes and keywords")
+	dict2 := []byte("second completely different dictionary content for reuse check")
+	src1 := []byte("first dictionary content should compress nicely here")
+	src2 := []byte("second completely different dictionary content here as well")
+
+	for range 3 {
+		dst1 := make([]byte, lz4block.CompressBlockBound(len(src1)))
+		n1, err := c.CompressBlockWithDict(src1, dst1, dict1)
+		if err != nil {
+			t.Fatalf("reuse run src1 failed: %v", err)
+		}
+		dec1 := make([]byte, len(src1))
+		if _, err := lz4block.UncompressBlock(dst1[:n1], dec1, dict1); err != nil || !bytes.Equal(dec1, src1) {
+			t.Fatalf("reuse uncompress src1 mismatch")
+		}
+
+		dst2 := make([]byte, lz4block.CompressBlockBound(len(src2)))
+		n2, err := c.CompressBlockWithDict(src2, dst2, dict2)
+		if err != nil {
+			t.Fatalf("reuse run src2 failed: %v", err)
+		}
+		dec2 := make([]byte, len(src2))
+		if _, err := lz4block.UncompressBlock(dst2[:n2], dec2, dict2); err != nil || !bytes.Equal(dec2, src2) {
+			t.Fatalf("reuse uncompress src2 mismatch")
+		}
+
+		// Also run with no dictionary in between.
+		dstNoDict := make([]byte, lz4block.CompressBlockBound(len(src1)))
+		nNoDict, err := c.CompressBlock(src1, dstNoDict)
+		if err != nil {
+			t.Fatalf("reuse run nodict failed: %v", err)
+		}
+		decNoDict := make([]byte, len(src1))
+		if _, err := lz4block.UncompressBlock(dstNoDict[:nNoDict], decNoDict, nil); err != nil || !bytes.Equal(decNoDict, src1) {
+			t.Fatalf("reuse uncompress nodict mismatch")
+		}
+	}
+}

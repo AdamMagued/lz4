@@ -37,6 +37,7 @@ type Writer struct {
 	idx     int                       // size of pending data
 	handler func(int)
 	legacy  bool
+	dict    []byte
 }
 
 func (*Writer) private() {}
@@ -65,6 +66,9 @@ func (w *Writer) isNotConcurrent() bool {
 
 // init sets up the Writer when in newState. It does not change the Writer state.
 func (w *Writer) init() error {
+	if len(w.dict) > 0 {
+		w.num = 1
+	}
 	if !w.legacy && !w.frame.Descriptor.Flags.BlockSizeIndex().IsValid() {
 		// Block8Mb is only valid in legacy frames, and LegacyOption may be
 		// applied after BlockSizeOption.
@@ -132,7 +136,7 @@ func (w *Writer) Write(buf []byte) (n int, err error) {
 func (w *Writer) write(data []byte, safe bool) error {
 	if w.isNotConcurrent() {
 		block := w.frame.Blocks.Block
-		err := block.Compress(w.frame, data, w.level).Write(w.frame, w.src)
+		err := block.CompressWithDict(w.frame, data, w.level, w.dict).Write(w.frame, w.src)
 		w.handler(len(block.Data))
 		return err
 	}
