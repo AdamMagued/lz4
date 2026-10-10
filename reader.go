@@ -3,6 +3,7 @@ package lz4
 import (
 	"bytes"
 	"io"
+	"slices"
 
 	"github.com/pierrec/lz4/v4/internal/lz4block"
 	"github.com/pierrec/lz4/v4/internal/lz4errors"
@@ -229,7 +230,7 @@ func (r *Reader) Reset(reader io.Reader) {
 	r.state.reset()
 	r.src = reader
 	r.reads = nil
-	r.dict = bytes.Clone(r.presetDict)
+	r.dict = slices.Clip(bytes.Clone(r.presetDict))
 }
 
 // WriteTo efficiently uncompresses the data from the Reader underlying source to w.

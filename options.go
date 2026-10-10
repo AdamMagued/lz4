@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"runtime"
+	"slices"
 
 	"github.com/pierrec/lz4/v4/internal/lz4block"
 	"github.com/pierrec/lz4/v4/internal/lz4errors"
@@ -261,7 +262,7 @@ func LegacyOption(legacy bool) Option {
 // DictionaryOption defines the dictionary to use for compression and decompression.
 // Concurrency is disabled for Writer and Reader when a dictionary is set.
 func DictionaryOption(dict []byte) Option {
-	dict = bytes.Clone(dict)
+	dict = slices.Clip(bytes.Clone(dict))
 	return func(a applier) error {
 		switch rw := a.(type) {
 		case nil:
@@ -274,8 +275,8 @@ func DictionaryOption(dict []byte) Option {
 			rw.dict = dict
 			return nil
 		case *Reader:
-			rw.presetDict = dict
-			rw.dict = dict
+			rw.presetDict = slices.Clip(bytes.Clone(dict))
+			rw.dict = rw.presetDict
 			return nil
 		case *CompressingReader:
 			if len(dict) > 0 && rw.level != lz4block.Fast {

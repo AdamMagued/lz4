@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1063,15 +1064,82 @@ func TestWriter_DictionaryOptionsValidation(t *testing.T) {
 		t.Fatalf("expected ErrOptionNotApplicable for CCompatFast after dict, got %v", err)
 	}
 
-	// Reader does not overwrite caller slice with spare capacity.
+	// Caller slice mutation and spare capacity do not affect dictionary compression/decompression.
 	rawDict := make([]byte, len(dict), len(dict)+64)
 	copy(rawDict, dict)
-	zr := lz4.NewReader(bytes.NewReader(nil))
-	if err := zr.Apply(lz4.DictionaryOption(rawDict)); err != nil {
+	opt := lz4.DictionaryOption(rawDict)
+
+	var compressed bytes.Buffer
+	zw3 := lz4.NewWriter(&compressed)
+	if err := zw3.Apply(opt); err != nil {
+		t.Fatalf("zw3 Apply failed: %v", err)
+	}
+	src := []byte("test dictionary content repeated payload for round trip check")
+	if _, err := zw3.Write(src); err != nil {
+		t.Fatalf("zw3 Write failed: %v", err)
+	}
+	if err := zw3.Close(); err != nil {
+		t.Fatalf("zw3 Close failed: %v", err)
+	}
+
+	// Mutate caller slice and its spare capacity.
+	for i := range rawDict {
+		rawDict[i] = 0xAA
+	}
+	_ = append(rawDict, "polluted spare capacity bytes"...)
+
+	zr := lz4.NewReader(bytes.NewReader(compressed.Bytes()))
+	if err := zr.Apply(opt); err != nil {
 		t.Fatalf("zr Apply failed: %v", err)
 	}
-	if cap(rawDict) > len(rawDict) {
-		// Mutating spare capacity should not affect reader's stored copy.
-		rawDict = append(rawDict, "polluted"...)
+	decompressed, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("zr ReadAll failed: %v", err)
 	}
+	if !bytes.Equal(decompressed, src) {
+		t.Fatalf("decoded output mismatch after mutating caller dictionary")
+	}
+}
+
+func TestReader_SharedDictionaryOptionConcurrent(t *testing.T) {
+	dict := []byte("shared dictionary content for concurrent readers")
+	opt := lz4.DictionaryOption(dict)
+
+	// Create a multi-block frame (dependent blocks) compressed with the dictionary.
+	src := bytes.Repeat([]byte("shared dictionary content block data with repeated patterns\n"), 1000)
+	var buf bytes.Buffer
+	zw := lz4.NewWriter(&buf)
+	if err := zw.Apply(lz4.BlockSizeOption(lz4.Block64Kb), opt); err != nil {
+		t.Fatalf("zw Apply failed: %v", err)
+	}
+	if _, err := zw.Write(src); err != nil {
+		t.Fatalf("zw Write failed: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zw Close failed: %v", err)
+	}
+	compressed := buf.Bytes()
+
+	// Run multiple readers concurrently using the exact same DictionaryOption value.
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			zr := lz4.NewReader(bytes.NewReader(compressed))
+			if err := zr.Apply(opt); err != nil {
+				t.Errorf("zr Apply failed: %v", err)
+				return
+			}
+			out, err := io.ReadAll(zr)
+			if err != nil {
+				t.Errorf("zr ReadAll failed: %v", err)
+				return
+			}
+			if !bytes.Equal(out, src) {
+				t.Errorf("concurrent reader decompressed output mismatch")
+			}
+		}()
+	}
+	wg.Wait()
 }
